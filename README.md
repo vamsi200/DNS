@@ -14,6 +14,4 @@ Ensure you have Rust installed. Then, clone the repository and run:
 ```sh
 cargo build --release
 cargo run -- <domain-name>
-```
-```
 
