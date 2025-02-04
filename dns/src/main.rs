@@ -1,5 +1,6 @@
-#![allow(dead_code)]
-use std::error::Error;
+use std::fs::File;
+use std::io::Read;
+use std::{error::Error, net::Ipv4Addr};
 pub struct BytePacketBuffer {
     pub buf: [u8; 512],
     pub pos: usize,
@@ -18,7 +19,7 @@ impl BytePacketBuffer {
         self.pos += steps;
         Ok(())
     }
-    fn seek(&mut self, pos: usize) -> Result<(), Box<dyn Error>> {
+    fn change_pos(&mut self, pos: usize) -> Result<(), Box<dyn Error>> {
         self.pos = pos;
         Ok(())
     }
@@ -31,13 +32,13 @@ impl BytePacketBuffer {
         Ok(res)
     }
     fn get_buf(&mut self, pos: usize) -> Result<u8, Box<dyn Error>> {
-        if self.pos >= 512 {
+        if pos >= 512 {
             return Err("Reached End of Buffer".into());
         }
         Ok(self.buf[pos])
     }
     fn get_buf_range(&mut self, start: usize, len: usize) -> Result<&[u8], Box<dyn Error>> {
-        if self.pos >= 512 {
+        if start + len >= 512 {
             return Err("Reached End of Buffer".into());
         }
         Ok(&self.buf[start..start + len as usize])
@@ -66,7 +67,7 @@ impl BytePacketBuffer {
             let len = self.get_buf(pos)?;
             if (len & 0xC0) == 0xC0 {
                 if !jumped {
-                    self.seek(pos + 2)?;
+                    self.change_pos(pos + 2)?;
                 }
                 let b2 = self.get_buf(pos + 1)? as u16;
                 let offset = ((len as u16) ^ 0xC0) << 8 | b2;
@@ -85,10 +86,11 @@ impl BytePacketBuffer {
                 delim = ".";
                 pos += len as usize;
             }
-            if !jumped {
-                self.seek(pos)?;
-            }
         }
+        if !jumped {
+            self.change_pos(pos)?;
+        }
+
         Ok(())
     }
 }
@@ -199,10 +201,7 @@ pub struct DnsQuestion {
 }
 impl DnsQuestion {
     pub fn new(name: String, qtype: QueryType) -> DnsQuestion {
-        DnsQuestion {
-            name: name,
-            qtype: qtype,
-        }
+        DnsQuestion { name, qtype }
     }
     pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), Box<dyn Error>> {
         buffer.read_qname(&mut self.name)?;
@@ -211,7 +210,124 @@ impl DnsQuestion {
         Ok(())
     }
 }
-fn main() {
-    println!("Hello, world!");
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DnsRecord {
+    UNKNOWN {
+        domain: String,
+        qtype: u16,
+        data_len: u16,
+        ttl: u32,
+    },
+    A {
+        domain: String,
+        addr: Ipv4Addr,
+        ttl: u32,
+    },
 }
 
+impl DnsRecord {
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsRecord, Box<dyn Error>> {
+        let mut domain = String::new();
+        buffer.read_qname(&mut domain)?;
+
+        let qtype_num = buffer.read_u16()?;
+        let qtype = QueryType::from_num(qtype_num);
+        let _ = buffer.read_u16()?;
+        let ttl = buffer.read_u32()?;
+        let data_len = buffer.read_u16()?;
+
+        match qtype {
+            QueryType::A => {
+                let raw_addr = buffer.read_u32()?;
+                let addr = Ipv4Addr::new(
+                    ((raw_addr >> 24) & 0xFF) as u8,
+                    ((raw_addr >> 16) & 0xFF) as u8,
+                    ((raw_addr >> 8) & 0xFF) as u8,
+                    ((raw_addr >> 0) & 0xFF) as u8,
+                );
+
+                Ok(DnsRecord::A { domain, addr, ttl })
+            }
+            QueryType::UNKNOWN(_) => {
+                buffer.step(data_len as usize)?;
+
+                Ok(DnsRecord::UNKNOWN {
+                    domain,
+                    qtype: qtype_num,
+                    data_len,
+                    ttl,
+                })
+            }
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct DnsPacket {
+    pub header: DnsHeader,
+    pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsRecord>,
+    pub authorities: Vec<DnsRecord>,
+    pub resources: Vec<DnsRecord>,
+}
+
+impl DnsPacket {
+    pub fn new() -> DnsPacket {
+        DnsPacket {
+            header: DnsHeader::new(),
+            questions: Vec::new(),
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            resources: Vec::new(),
+        }
+    }
+
+    pub fn from_buffer(buffer: &mut BytePacketBuffer) -> Result<DnsPacket, Box<dyn Error>> {
+        let mut result = DnsPacket::new();
+        result.header.read(buffer)?;
+
+        for _ in 0..result.header.questions {
+            let mut question = DnsQuestion::new("".to_string(), QueryType::UNKNOWN(0));
+            question.read(buffer)?;
+            result.questions.push(question);
+        }
+
+        for _ in 0..result.header.answers {
+            let rec = DnsRecord::read(buffer)?;
+            result.answers.push(rec);
+        }
+        for _ in 0..result.header.authoritative_entries {
+            let rec = DnsRecord::read(buffer)?;
+            result.authorities.push(rec);
+        }
+        for _ in 0..result.header.resource_entries {
+            let rec = DnsRecord::read(buffer)?;
+            result.resources.push(rec);
+        }
+
+        Ok(result)
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut f = File::open("response_packet.txt")?;
+    let mut buffer = BytePacketBuffer::new();
+    f.read(&mut buffer.buf)?;
+
+    let packet = DnsPacket::from_buffer(&mut buffer)?;
+    println!("{:#?}", packet.header);
+
+    for q in packet.questions {
+        println!("{:#?}", q);
+    }
+    for rec in packet.answers {
+        println!("{:#?}", rec);
+    }
+    for rec in packet.authorities {
+        println!("{:#?}", rec);
+    }
+    for rec in packet.resources {
+        println!("{:#?}", rec);
+    }
+
+    Ok(())
+}
