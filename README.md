@@ -1,10 +1,9 @@
-# DNS Resolver in Rust  
+# DNS server from scratch  
 
 This repository is a follow-through of [Emil Hernvall's DNS guide](https://github.com/EmilHernvall/dnsguide.git).  
 I'm implementing the steps from the guide to deepen my understanding of network programming.  
 
 ## What This Project Does  
-- A simple **DNS resolver** built from scratch in Rust.  
 - Uses **UDP sockets** to send and receive DNS queries.  
 - Parses DNS responses and extracts meaningful data.  
 
