@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::net::Ipv6Addr;
 use std::{error::Error, net::Ipv4Addr, net::UdpSocket};
+
 pub struct BytePacketBuffer {
     pub buf: [u8; 512],
     pub pos: usize,
@@ -611,9 +612,51 @@ impl DnsPacket {
 
         Ok(())
     }
+
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::A { addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .next()
+    }
+
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.authorities
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::NS { domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
+            })
+            .filter(move |(domain, _)| qname.ends_with(*domain))
+    }
+
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<Ipv4Addr> {
+        self.get_ns(qname)
+            .flat_map(|(_, host)| {
+                self.resources
+                    .iter()
+                    .filter_map(move |record| match record {
+                        DnsRecord::A { domain, addr, .. } if domain == host => Some(addr),
+                        _ => None,
+                    })
+            })
+            .map(|addr| *addr)
+            .next()
+    }
+
+    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        self.get_ns(qname).map(|(_, host)| host).next()
+    }
 }
 
-fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket, Box<dyn Error>> {
+fn lookup(
+    qname: &str,
+    qtype: QueryType,
+    _server: (Ipv4Addr, u16),
+) -> Result<DnsPacket, Box<dyn Error>> {
     let server = ("8.8.8.8", 53);
 
     let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
@@ -637,6 +680,44 @@ fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket, Box<dyn Error>> {
     DnsPacket::from_buffer(&mut res_buffer)
 }
 
+fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket, Box<dyn Error>> {
+    let mut ns = "192.41.0.4".parse::<Ipv4Addr>().unwrap();
+
+    loop {
+        println!("attempting lookup of {:?} {} with ns {}", qtype, qname, ns);
+
+        let ns_copy = ns;
+        let server = (ns_copy, 53);
+        let response = lookup(qname, qtype, server)?;
+
+        if !response.answers.is_empty() && response.header.rescode == ResultCode::NOERROR {
+            return Ok(response);
+        }
+        if response.header.rescode == ResultCode::NXDOMAIN {
+            return Ok(response);
+        }
+
+        if let Some(new_ns) = response.get_resolved_ns(qname) {
+            ns = new_ns;
+
+            continue;
+        }
+
+        let new_ns_name = match response.get_unresolved_ns(qname) {
+            Some(x) => x,
+            None => return Ok(response),
+        };
+
+        let recursive_response = recursive_lookup(&new_ns_name, QueryType::A)?;
+
+        if let Some(new_ns) = recursive_response.get_random_a() {
+            ns = new_ns;
+        } else {
+            return Ok(response);
+        }
+    }
+}
+
 fn handle_query(socket: &UdpSocket) -> Result<(), Box<dyn Error>> {
     let mut req_buffer = BytePacketBuffer::new();
     let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
@@ -653,7 +734,7 @@ fn handle_query(socket: &UdpSocket) -> Result<(), Box<dyn Error>> {
     if let Some(question) = request.questions.pop() {
         println!("Received Query {:?}", question);
 
-        if let Ok(result) = lookup(&question.name, question.qtype) {
+        if let Ok(result) = recursive_lookup(&question.name, question.qtype) {
             packet.questions.push(question);
             packet.header.rescode = result.header.rescode;
 
