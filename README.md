@@ -12,5 +12,10 @@ Ensure you have Rust installed. Then, clone the repository and run:
 
 ```sh
 cargo build --release
-cargo run -- <domain-name>
+cargo run
+```
+- Starts a Udpserver on port `2053`
 
+```sh 
+dig @127.0.0.1 -p 2053 google.com
+```
